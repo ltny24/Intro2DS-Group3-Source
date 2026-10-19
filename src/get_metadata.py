@@ -13,9 +13,11 @@ try:
 except ImportError:
     from utils import DATA_DIR, get_paper_dir
 
-# log hiển thị thời gian thực và mức độ thông báo
+# Chỉ hiện WARNING trở lên từ thư viện arxiv (ẩn Sleeping, Requesting page...)
+logging.getLogger("arxiv").setLevel(logging.WARNING)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -121,25 +123,17 @@ def _fetch_arxiv_results_with_retry(
 
 def get_entry_discovery(
     arXiv_id: str,
-    current_idx: Optional[int] = None,
-    total_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     base_id = _strip_version(arXiv_id)
 
-    progress_prefix = f"[{current_idx}/{total_count}] " if (current_idx and total_count) else ""
-
-    logger.info(f"{progress_prefix}Đang lấy metadata cho {base_id}...")
-
-
-    latest_results = _fetch_arxiv_results_with_retry([base_id], progress_prefix=progress_prefix)
+    latest_results = _fetch_arxiv_results_with_retry([base_id])
     if not latest_results:
-        raise ValueError(f"{progress_prefix}Không tìm thấy bài báo: {base_id}")
+        raise ValueError(f"Không tìm thấy bài báo: {base_id}")
 
     latest_paper = latest_results[0]
-    
+
     # Hậu tố vN ở entry_id của bản mới nhất chính là tổng số version của bài báo
     num_versions = _extract_version_num(latest_paper.entry_id)
-
 
     # Lấy submission_date và revised_dates
     if num_versions == 1:
@@ -148,8 +142,7 @@ def get_entry_discovery(
     else:
         # Nếu có nhiều version, gom toàn bộ ID từ v1 -> vN vào 1 lần gọi API để lấy ngày của từng bản
         version_ids = [f"{base_id}v{v}" for v in range(1, num_versions + 1)]
-        logger.info(f"{progress_prefix}Bài {base_id} có {num_versions} versions, đang lấy lịch sử ngày...")
-        version_results = _fetch_arxiv_results_with_retry(version_ids, progress_prefix=progress_prefix)
+        version_results = _fetch_arxiv_results_with_retry(version_ids)
 
         # Sắp xếp lại các version theo thứ tự
         version_results_sorted = sorted(
@@ -198,9 +191,6 @@ def get_entry_discovery(
         "abstract": clean_abstract,
     }
 
-    logger.info(
-        f"{progress_prefix}Xong {base_id} (v{num_versions}, ngày nộp: {submission_date}, sửa: {len(revised_dates)} lần)."
-    )
     return metadata
 
 
@@ -229,21 +219,29 @@ def process_batch_metadata(
     fail_count = 0
     skipped_count = 0
 
-
     if state_file is None:
         state_file = DATA_DIR / "metadata_crawl_state.json"
 
-    logger.info(f"Bắt đầu cào metadata cho {total} bài báo...")
+    # Đếm sẵn số bài đã có để hiện thống kê ban đầu
+    pre_skipped = 0
+    if skip_existing:
+        for raw_id in arxiv_ids:
+            mf = get_paper_dir(_strip_version(raw_id)) / "metadata.json"
+            if mf.exists():
+                pre_skipped += 1
+
+    print(
+        f"Total: {total} | Already done: {pre_skipped} | "
+        f"Remaining: {total - pre_skipped}"
+    )
 
     for idx, raw_id in enumerate(arxiv_ids, start=1):
         base_id = _strip_version(raw_id)
-        
-        progress_str = f"[{idx}/{total} - {(idx / total) * 100:.1f}%]"
-
         paper_dir = get_paper_dir(base_id)
         metadata_file = paper_dir / "metadata.json"
+        prefix = f"[{idx}/{total}]"
 
-        # Kiểm tra lưu state: nếu bài này đã có file metadata.json hợp lệ thì đọc lên luôn, không gọi API lại
+        # Kiểm tra lưu state: nếu bài này đã có file metadata.json hợp lệ thì đọc lên luôn
         if skip_existing and metadata_file.exists():
             try:
                 with open(metadata_file, "r", encoding="utf-8") as f:
@@ -252,22 +250,20 @@ def process_batch_metadata(
                     papers_table.append(existing_meta)
                     skipped_count += 1
                     success_count += 1
-                    logger.info(f"{progress_str} Bỏ qua {base_id} (đã có metadata.json).")
                     continue
             except Exception as e:
-                logger.warning(f"{progress_str} File cũ của {base_id} lỗi ({e}), tải lại...")
+                print(f"{prefix} [WARN] File cũ của {base_id} lỗi ({e}), tải lại...")
 
-        
         try:
-            metadata = get_entry_discovery(base_id, current_idx=idx, total_count=total)
+            metadata = get_entry_discovery(base_id)
             save_metadata(base_id, metadata)
             papers_table.append(metadata)
             success_count += 1
+            print(f"{prefix} {base_id} — OK")
 
-            # Cập nhật file state sau mỗi bài thành công để biết lần chạy gần nhất dừng ở đâu
+            # Cập nhật file state sau mỗi bài thành công
             state_data = {
                 "last_processed_id": base_id,
-                "current_index": idx,
                 "total": total,
                 "success_count": success_count,
                 "fail_count": fail_count,
@@ -279,17 +275,35 @@ def process_batch_metadata(
 
         except Exception as e:
             fail_count += 1
-            logger.error(f"{progress_str} Thất bại bài {base_id}: {e}")
+            print(f"{prefix} {base_id} — ERROR: {e}")
 
     papers_table_path = DATA_DIR / "papers.json"
     with open(papers_table_path, "w", encoding="utf-8") as pf:
         json.dump(papers_table, pf, ensure_ascii=False, indent=4)
 
-    logger.info(
-        f"Hoàn tất: {success_count}/{total} bài "
+    print(
+        f"\nHoàn tất: {success_count}/{total} bài "
         f"(Tải mới: {success_count - skipped_count}, Có sẵn: {skipped_count}, Lỗi: {fail_count})."
     )
     return papers_table
+
+
+def generate_arxiv_ids(start_id: str, end_id: str) -> List[str]:
+    """Sinh danh sách arxiv ID liên tiếp từ start_id đến end_id.
+    
+    Ví dụ: generate_arxiv_ids("2310.00001", "2310.00050")
+    => ["2310.00001", "2310.00002", ..., "2310.00050"]
+    """
+    # Tách prefix (ví dụ "2310.") và số (ví dụ "00001")
+    match_start = re.match(r"(\d{4}\.)(\d+)", start_id.strip())
+    match_end = re.match(r"(\d{4}\.)(\d+)", end_id.strip())
+    if not match_start or not match_end:
+        raise ValueError(f"ID không hợp lệ: {start_id} hoặc {end_id}")
+    prefix = match_start.group(1)
+    num_digits = len(match_start.group(2))
+    start_num = int(match_start.group(2))
+    end_num = int(match_end.group(2))
+    return [f"{prefix}{str(n).zfill(num_digits)}" for n in range(start_num, end_num + 1)]
 
 
 if __name__ == "__main__":
